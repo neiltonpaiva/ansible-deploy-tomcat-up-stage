@@ -1,0 +1,87 @@
+# Configurações globais do ambiente Ubuntu
+tomcat_home: "/opt/tomcat/current"
+tomcat_user: "tomcat"
+tomcat_service: "tomcat"
+tomcat_port: 8080
+
+# Sistema operacional
+target_os: "ubuntu"
+package_manager: "apt"
+python_interpreter: "/usr/bin/python3"
+
+# Diretórios de aplicação
+app_directories:
+  webapps: "{{ tomcat_home }}/webapps"
+  datasul_report: "{{ tomcat_home }}/Datasul-report"
+  lib: "{{ tomcat_home }}/lib"
+
+# Diretórios a preservar durante updates de versão
+preserve_directories:
+  - "{{ tomcat_home }}/webapps/custom"
+  - "{{ tomcat_home }}/webapps/custom_fsw"
+
+# URLs para health check
+health_check:
+  local_url: "https://{{ ansible_default_ipv4.address }}:{{ tomcat_port }}/totvs-menu"
+  load_balancer_url: "https://gp.unimedrj.coop.br/totvs-menu"
+
+# Backup configuration (Ubuntu paths)
+backup_base_dir: "/opt/backups/tomcat"
+backup_retention_days: 30
+backup_compression: true
+
+# FSx mount point
+fsx_mount: "/mnt/ansible"
+
+# Deploy configuration - Ubuntu optimized
+deploy_timeout: 600  # 10 minutos
+health_check_retries: 15
+health_check_delay: 20
+deployment_batch_size: 2  # Para WAR deploys
+version_deployment_serial: 1  # Para version deploys
+
+# Log monitoring
+tomcat_log_file: "{{ tomcat_home }}/logs/catalina.out"
+deployment_success_patterns:
+  - "Server startup"
+  - "Deployment of web application"
+  - "started successfully"
+  - "INFO: Starting service"
+
+# Ubuntu-specific service management
+service_manager: "systemd"
+service_restart_delay: 10
+
+# Network and security (Ubuntu)
+ssh_connection_timeout: 30
+ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+# Logging configuration
+log_level: "INFO"
+log_retention_days: 30
+
+# Custom directories configuration (NOVA SEÇÃO)
+custom_directories:
+  preserve_during_war_deploy: true
+  preserve_during_version_deploy: true
+  backup_before_version_deploy: true
+  directories:
+    - name: "custom"
+      path: "{{ tomcat_home }}/webapps/custom"
+      description: "Customizações padrão da aplicação"
+    - name: "custom_fsw"
+      path: "{{ tomcat_home }}/webapps/custom_fsw"
+      description: "Customizações FSW específicas"
+
+# Notification settings (for future integrations)
+notification:
+  enabled: false
+  slack_webhook: ""
+  email_recipients: []
+  
+# Monitoring settings
+monitoring:
+  enabled: true
+  collect_metrics: true
+  performance_tracking: true
+  custom_directories_monitoring: true  # Monitor custom dirs

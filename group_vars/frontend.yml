@@ -1,0 +1,86 @@
+# Configurações específicas dos servidores frontend Ubuntu
+max_heap_size: "2048m"
+min_heap_size: "1024m"
+
+# Ubuntu-specific configurations
+ubuntu_version: "{{ ansible_distribution_version }}"
+kernel_version: "{{ ansible_kernel }}"
+
+# Package management
+required_packages:
+  - openjdk-8-jdk
+  - curl
+  - wget
+  - unzip
+  - rsync
+
+# Configurações de monitoramento
+monitoring_enabled: true
+log_aggregation: true
+metrics_collection: true
+
+# Configurações de backup específicas
+backup_before_deploy: true
+backup_compress: true
+backup_verification: true
+
+# Performance tuning para Ubuntu
+system_optimization:
+  tcp_keepalive: true
+  file_descriptor_limit: 65536
+  max_connections: 1000
+
+# Security configurations
+security:
+  disable_root_login: true
+  ufw_enabled: false  # Assumindo que AWS Security Groups são usados
+  fail2ban_enabled: false
+  
+# Service management
+service_management:
+  start_timeout: 120
+  stop_timeout: 60
+  restart_strategy: "graceful"
+  
+# Disk and storage
+storage:
+  temp_dir: "/tmp"
+  log_retention_policy: "30 days"
+  cleanup_enabled: true
+  
+# Network configuration
+network:
+  max_file_descriptors: 65536
+  tcp_fin_timeout: 30
+  tcp_tw_reuse: true
+
+# JVM specific configurations for Ubuntu
+jvm_options:
+  - "-Xms{{ min_heap_size }}"
+  - "-Xmx{{ max_heap_size }}"
+  - "-XX:+UseG1GC"
+  - "-XX:G1HeapRegionSize=16m"
+  - "-XX:+UseStringDeduplication"
+  - "-Djava.security.egd=file:/dev/./urandom"
+  - "-Dfile.encoding=UTF-8"
+
+# Health check specifics
+health_check_endpoints:
+  - path: "/totvs-menu"
+    method: "GET"
+    expected_status: [200, 302, 301]
+    timeout: 30
+  - path: "/actuator/health"
+    method: "GET" 
+    expected_status: [200, 404]  # 404 is OK if endpoint doesn't exist
+    timeout: 10
+
+# Deployment windows (Ubuntu timezone aware)
+deployment_windows:
+  war_updates:
+    allowed_hours: [6, 7, 8, 20, 21, 22]  # 6-8 AM, 8-10 PM
+    business_days_only: false
+  version_updates:
+    allowed_hours: [2, 3, 4, 5]  # 2-5 AM only
+    business_days_only: false
+    maintenance_window_required: true

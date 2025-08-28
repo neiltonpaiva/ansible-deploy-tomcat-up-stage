@@ -1,0 +1,248 @@
+#!/bin/bash
+# User Data Script for Ubuntu EC2 Instance - Ansible MCP Server
+# Este script será executado automaticamente na primeira inicialização
+
+set -euo pipefail
+
+# Configurações
+ANSIBLE_USER="ubuntu"
+ANSIBLE_DIR="/opt/ansible-deploys"
+FSX_MOUNT="/mnt/ansible"
+
+# Função de log
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/ansible-setup.log
+}
+
+log "=== Iniciando configuração automática do servidor Ansible MCP ==="
+
+# Atualizar sistema
+log "Atualizando sistema Ubuntu..."
+apt update -y
+apt upgrade -y
+
+# Instalar dependências básicas
+log "Instalando dependências básicas..."
+apt install -y \
+    software-properties-common \
+    curl \
+    wget \
+    unzip \
+    jq \
+    cifs-utils \
+    rsync \
+    git \
+    python3-pip \
+    python3-boto3
+
+# Adicionar repositório Ansible e instalar
+log "Instalando Ansible..."
+add-apt-repository --yes --update ppa:ansible/ansible
+apt install -y ansible
+
+# Verificar instalação
+ANSIBLE_VERSION=$(ansible --version | head -1)
+log "Ansible instalado: $ANSIBLE_VERSION"
+
+# Criar usuário ansible se não existir (além do ubuntu)
+if ! id "ansible" &>/dev/null; then
+    log "Criando usuário ansible..."
+    useradd -m -s /bin/bash ansible
+    usermod -aG sudo ansible
+    echo "ansible ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/ansible
+fi
+
+# Criar estrutura de diretórios
+log "Criando estrutura do Ansible..."
+mkdir -p $ANSIBLE_DIR/{playbooks,group_vars,host_vars,roles,scripts,logs,backups}
+mkdir -p $FSX_MOUNT
+mkdir -p /home/$ANSIBLE_USER/.ssh
+
+# Definir permissões
+chown -R $ANSIBLE_USER:$ANSIBLE_USER $ANSIBLE_DIR
+chown $ANSIBLE_USER:$ANSIBLE_USER $FSX_MOUNT
+chmod 755 $ANSIBLE_DIR
+chmod 755 $FSX_MOUNT
+
+# Gerar chave SSH para o usuário
+log "Gerando chaves SSH..."
+sudo -u $ANSIBLE_USER ssh-keygen -t rsa -b 4096 -f /home/$ANSIBLE_USER/.ssh/id_rsa -N ""
+
+# Configurar SSH
+log "Configurando SSH..."
+cat > /home/$ANSIBLE_USER/.ssh/config << 'EOF'
+Host 172.16.3.*
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+    ConnectTimeout 10
+    ServerAliveInterval 60
+EOF
+
+chown $ANSIBLE_USER:$ANSIBLE_USER /home/$ANSIBLE_USER/.ssh/config
+chmod 600 /home/$ANSIBLE_USER/.ssh/config
+
+# Instalar AWS CLI v2
+log "Instalando AWS CLI v2..."
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+./aws/install
+rm -rf aws awscliv2.zip
+
+# Configurar logrotate para logs do Ansible
+log "Configurando logrotate..."
+cat > /etc/logrotate.d/ansible-deploys << 'EOF'
+/opt/ansible-deploys/logs/*.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    copytruncate
+}
+EOF
+
+# Criar script de saúde do sistema
+log "Criando script de health check..."
+cat > /usr/local/bin/mcp-health-check.sh << 'EOF'
+#!/bin/bash
+# Health check do servidor MCP
+
+echo "=== MCP Server Health Check ==="
+echo "Date: $(date)"
+echo "Uptime: $(uptime)"
+echo ""
+
+echo "=== Disk Usage ==="
+df -h | grep -E "(Filesystem|/dev/|/mnt)"
+echo ""
+
+echo "=== Memory Usage ==="
+free -h
+echo ""
+
+echo "=== FSx Mount Status ==="
+if mountpoint -q /mnt/ansible; then
+    echo "✓ FSx mounted successfully"
+    ls -la /mnt/ansible | head -5
+else
+    echo "✗ FSx not mounted"
+fi
+echo ""
+
+echo "=== Ansible Status ==="
+ansible --version | head -1
+echo ""
+
+echo "=== Recent Logs ==="
+if [ -d "/opt/ansible-deploys/logs" ]; then
+    echo "Log files:"
+    ls -la /opt/ansible-deploys/logs/ | tail -5
+else
+    echo "No logs directory found"
+fi
+EOF
+
+chmod +x /usr/local/bin/mcp-health-check.sh
+
+# Criar arquivo de informações do servidor
+log "Criando arquivo de informações..."
+cat > /home/$ANSIBLE_USER/SERVER-INFO.md << EOF
+# Servidor MCP Ansible - Configuração
+
+## Informações da Instância
+- **OS**: Ubuntu $(lsb_release -rs)
+- **User**: $ANSIBLE_USER  
+- **Ansible Dir**: $ANSIBLE_DIR
+- **FSx Mount**: $FSX_MOUNT
+- **Data Setup**: $(date)
+
+## Chave SSH Pública
+\`\`\`
+$(cat /home/$ANSIBLE_USER/.ssh/id_rsa.pub)
+\`\`\`
+
+## Próximos Passos
+1. **Copiar esta chave SSH** para os 7 servidores frontend
+2. **Configurar FSx mount** (ver exemplo abaixo)
+3. **Fazer upload das configurações** Ansible
+4. **Executar primeiro teste**
+
+## Exemplo de Mount FSx
+\`\`\`bash
+# Substitua fs-xxxxx pelo seu FSx ID
+sudo mount -t cifs //fs-xxxxx.fsx.us-east-1.amazonaws.com/share /mnt/ansible \\
+    -o username=admin,password=SuaSenha,uid=$ANSIBLE_USER,gid=$ANSIBLE_USER
+
+# Para mount permanente (/etc/fstab):
+echo "//fs-xxxxx.fsx.us-east-1.amazonaws.com/share /mnt/ansible cifs credentials=/etc/cifs-credentials,uid=$ANSIBLE_USER,gid=$ANSIBLE_USER,iocharset=utf8 0 0" >> /etc/fstab
+\`\`\`
+
+## Health Check
+\`\`\`bash
+sudo /usr/local/bin/mcp-health-check.sh
+\`\`\`
+EOF
+
+chown $ANSIBLE_USER:$ANSIBLE_USER /home/$ANSIBLE_USER/SERVER-INFO.md
+
+# Instalar motd personalizado
+log "Configurando MOTD personalizado..."
+cat > /etc/motd << 'EOF'
+ ╔══════════════════════════════════════════════════════════════════╗
+ ║                    🚀 ANSIBLE MCP SERVER 🚀                     ║
+ ║                   Tomcat Deployment Automation                  ║
+ ╠══════════════════════════════════════════════════════════════════╣
+ ║  📁 Ansible Dir: /opt/ansible-deploys                          ║
+ ║  💾 FSx Mount:   /mnt/ansible                                   ║
+ ║  🔑 SSH Key:     ~/.ssh/id_rsa                                  ║
+ ║  📋 Info:        ~/SERVER-INFO.md                              ║
+ ║  🏥 Health:      sudo /usr/local/bin/mcp-health-check.sh       ║
+ ╚══════════════════════════════════════════════════════════════════╝
+EOF
+
+# Configurar aliases úteis
+log "Configurando aliases..."
+cat >> /home/$ANSIBLE_USER/.bashrc << 'EOF'
+
+# Ansible MCP Aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias ansible-dir='cd /opt/ansible-deploys'
+alias ansible-logs='cd /opt/ansible-deploys/logs && ls -la'
+alias fsx-check='mountpoint /mnt/ansible && ls -la /mnt/ansible'
+alias mcp-health='sudo /usr/local/bin/mcp-health-check.sh'
+alias deploy-menu='/opt/ansible-deploys/scripts/deploy-manager.sh'
+
+# Ansible environment
+export ANSIBLE_CONFIG=/opt/ansible-deploys/ansible.cfg
+export ANSIBLE_INVENTORY=/opt/ansible-deploys/inventory.yml
+
+EOF
+
+# Recarregar configurações do usuário
+sudo -u $ANSIBLE_USER source /home/$ANSIBLE_USER/.bashrc
+
+# Criar cron job para limpeza de logs (opcional)
+log "Configurando limpeza automática de logs..."
+echo "0 2 * * 0 find /opt/ansible-deploys/logs -name '*.log' -mtime +30 -delete" | crontab -u $ANSIBLE_USER -
+
+# Status final
+log "Configuração concluída com sucesso!"
+log "Chave SSH pública:"
+cat /home/$ANSIBLE_USER/.ssh/id_rsa.pub | tee -a /var/log/ansible-setup.log
+
+# Reinicializar serviços se necessário
+systemctl enable ssh
+systemctl restart ssh
+
+log "=== Setup completo! Verifique ~/SERVER-INFO.md para próximos passos ==="
+
+# Executar health check inicial
+log "Executando health check inicial..."
+/usr/local/bin/mcp-health-check.sh | tee -a /var/log/ansible-setup.log
+
+# Finalizar
+log "Instance ready! Connect via SSH and check ~/SERVER-INFO.md"

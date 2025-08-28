@@ -1,0 +1,412 @@
+---
+- name: "Rollback Emergency - Ubuntu Environment"
+  hosts: frontend_servers
+  serial: 1
+  gather_facts: yes
+  vars_prompt:
+    - name: backup_date
+      prompt: "Enter backup date (YYYY-MM-DD)"
+      private: no
+    - name: server_name
+      prompt: "Enter server name (tomcat-01 to tomcat-07, or 'all')"
+      private: no
+    - name: rollback_type
+      prompt: "Rollback type (war/version)"
+      private: no
+      
+  vars:
+    rollback_source: "{{ backup_base_dir }}/{{ 'version/' if rollback_type == 'version' else '' }}{{ backup_date }}"
+    
+  pre_tasks:
+    - name: "Verificar OS (deve ser Ubuntu)"
+      fail:
+        msg: "Este playbook é específico para Ubuntu. OS detectado: {{ ansible_distribution }}"
+      when: ansible_distribution != "Ubuntu"
+      
+    - name: "Filtrar servidor específico se solicitado"
+      meta: end_host
+      when: 
+        - server_name != 'all'
+        - inventory_hostname != server_name
+        
+    - name: "Confirmação de rollback crítico"
+      pause:
+        prompt: |
+          ==========================================
+          ⚠️  ROLLBACK DE EMERGÊNCIA ⚠️
+          ==========================================
+          Servidor: {{ inventory_hostname }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Tipo: {{ rollback_type | upper }}
+          Data do Backup: {{ backup_date }}
+          
+          ATENÇÃO: Esta operação irá:
+          - Parar o Tomcat
+          - Restaurar backup anterior
+          - Perder configurações atuais
+          
+          Continuar? Digite 'ROLLBACK' para confirmar
+      register: rollback_confirmation
+      
+    - name: "Verificar confirmação"
+      fail:
+        msg: "Rollback cancelado. Confirmação incorreta."
+      when: rollback_confirmation.user_input != "ROLLBACK"
+    
+  tasks:
+    - name: "Coletar informações do sistema Ubuntu"
+      setup:
+        filter: "ansible_distribution*,ansible_memtotal_mb"
+      
+    - name: "Exibir informações do rollback"
+      debug:
+        msg: |
+          ==========================================
+          INICIANDO ROLLBACK DE EMERGÊNCIA
+          ==========================================
+          Servidor: {{ inventory_hostname }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Tipo: {{ rollback_type | upper }}
+          Source: {{ rollback_source }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          ==========================================
+
+    - name: "Validar se diretório de backup existe"
+      stat:
+        path: "{{ rollback_source }}"
+      register: backup_dir
+      become: yes
+      
+    - name: "Falhar se diretório de backup não existir"
+      fail:
+        msg: "Diretório de backup não encontrado: {{ rollback_source }}"
+      when: not backup_dir.stat.exists
+      
+    - name: "Listar arquivos de backup disponíveis"
+      find:
+        paths: "{{ rollback_source }}"
+        patterns: "{{ inventory_hostname }}_*backup*.tar.gz"
+      register: backup_files
+      become: yes
+      
+    - name: "Exibir backups encontrados"
+      debug:
+        msg: |
+          Backups encontrados para {{ inventory_hostname }}:
+          {% for file in backup_files.files %}
+          - {{ file.path }} ({{ (file.size / 1024 / 1024) | round(2) }} MB)
+          {% endfor %}
+      
+    - name: "Falhar se backup não encontrado"
+      fail:
+        msg: "Backup não encontrado para {{ inventory_hostname }} na data {{ backup_date }}"
+      when: backup_files.files | length == 0
+      
+    - name: "Selecionar arquivo de backup (mais recente se múltiplos)"
+      set_fact:
+        selected_backup: "{{ (backup_files.files | sort(attribute='mtime') | last).path }}"
+        
+    - name: "Confirmar arquivo selecionado"
+      debug:
+        msg: "Arquivo de backup selecionado: {{ selected_backup }}"
+
+    - name: "Criar backup de emergência do estado atual"
+      shell: |
+        emergency_backup_dir="{{ backup_base_dir }}/emergency/{{ ansible_date_time.date }}"
+        mkdir -p "$emergency_backup_dir"
+        
+        cd {{ tomcat_home }}
+        if [ "{{ rollback_type }}" == "version" ]; then
+          tar -czf "$emergency_backup_dir/{{ inventory_hostname }}_pre_rollback_{{ ansible_date_time.epoch }}.tar.gz" \
+            webapps Datasul-report lib 2>/dev/null || echo "Backup de emergência falhou"
+        else
+          cd webapps
+          tar -czf "$emergency_backup_dir/{{ inventory_hostname }}_pre_rollback_wars_{{ ansible_date_time.epoch }}.tar.gz" \
+            *.war 2>/dev/null || echo "Nenhum WAR para backup de emergência"
+        fi
+        
+        echo "Backup de emergência criado em: $emergency_backup_dir"
+      become: yes
+      register: emergency_backup
+      
+    - name: "Log do backup de emergência"
+      debug:
+        msg: "{{ emergency_backup.stdout }}"
+
+    - name: "Parar Tomcat para rollback (Ubuntu)"
+      systemd:
+        name: "{{ tomcat_service }}"
+        state: stopped
+      become: yes
+      register: rollback_tomcat_stop
+      
+    - name: "Aguardar Tomcat parar"
+      wait_for:
+        port: "{{ tomcat_port }}"
+        state: stopped
+        timeout: 120
+        
+    - name: "Verificar e encerrar processos Tomcat (Ubuntu)"
+      shell: |
+        pids=$(pgrep -f "{{ tomcat_home }}")
+        if [ -n "$pids" ]; then
+          echo "Encerrando processos: $pids"
+          kill -15 $pids
+          sleep 10
+          remaining=$(pgrep -f "{{ tomcat_home }}")
+          if [ -n "$remaining" ]; then
+            kill -9 $remaining
+            echo "Processos forçadamente encerrados"
+          fi
+        else
+          echo "Nenhum processo Tomcat para encerrar"
+        fi
+      become: yes
+
+    - name: "Limpar diretórios antes do rollback"
+      shell: |
+        if [ "{{ rollback_type }}" == "version" ]; then
+          echo "Limpando para rollback de versão..."
+          # Preservar custom se existir
+          if [ -d "{{ tomcat_home }}/webapps/custom" ]; then
+            cp -r {{ tomcat_home }}/webapps/custom /tmp/custom_rollback_{{ ansible_date_time.epoch }}
+          fi
+          rm -rf {{ tomcat_home }}/webapps/*
+          rm -rf {{ tomcat_home }}/Datasul-report/*
+          rm -rf {{ tomcat_home }}/lib/*
+        else
+          echo "Limpando para rollback de WAR..."
+          cd {{ tomcat_home }}/webapps
+          find . -maxdepth 1 -name "*.war" -not -path "./custom/*" -delete
+          find . -maxdepth 1 -type d -not -name "custom" -not -name "ROOT" -not -name "." -exec rm -rf {} + 2>/dev/null || true
+        fi
+      become: yes
+
+    - name: "Extrair backup (Ubuntu tar)"
+      shell: |
+        echo "Extraindo backup: {{ selected_backup }}"
+        cd {{ tomcat_home }}
+        
+        # Verificar integridade do backup
+        if tar -tzf "{{ selected_backup }}" >/dev/null 2>&1; then
+          echo "Backup válido, extraindo..."
+          tar -xzf "{{ selected_backup }}"
+          echo "Extração concluída"
+        else
+          echo "ERRO: Backup corrompido!"
+          exit 1
+        fi
+      become: yes
+      register: backup_extraction
+      
+    - name: "Verificar extração"
+      debug:
+        msg: "{{ backup_extraction.stdout }}"
+        
+    - name: "Falhar se extração falhou"
+      fail:
+        msg: "Falha na extração do backup"
+      when: "'ERRO' in backup_extraction.stdout"
+
+    - name: "Restaurar custom se foi preservado (version rollback)"
+      shell: |
+        if [ -d "/tmp/custom_rollback_{{ ansible_date_time.epoch }}" ]; then
+          echo "Restaurando custom preservado..."
+          mv /tmp/custom_rollback_{{ ansible_date_time.epoch }} {{ tomcat_home }}/webapps/custom
+          chown -R {{ tomcat_user }}:{{ tomcat_user }} {{ tomcat_home }}/webapps/custom
+          echo "Custom restaurado"
+        else
+          echo "Nenhum custom para restaurar"
+        fi
+      become: yes
+      when: rollback_type == "version"
+      register: custom_rollback_restore
+
+    - name: "Corrigir permissões após rollback (Ubuntu)"
+      file:
+        path: "{{ item }}"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_user }}"
+        mode: '0755'
+        recurse: yes
+      loop:
+        - "{{ tomcat_home }}/webapps"
+        - "{{ tomcat_home }}/Datasul-report"
+        - "{{ tomcat_home }}/lib"
+      become: yes
+      when: rollback_type == "version"
+      
+    - name: "Corrigir permissões webapps apenas (WAR rollback)"
+      file:
+        path: "{{ tomcat_home }}/webapps"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_user }}"
+        mode: '0755'
+        recurse: yes
+      become: yes
+      when: rollback_type == "war"
+      
+    - name: "Verificar arquivos restaurados"
+      shell: |
+        echo "=== Verificação pós-rollback ==="
+        if [ "{{ rollback_type }}" == "version" ]; then
+          echo "Webapps:"
+          ls -la {{ tomcat_home }}/webapps/ | head -5
+          echo ""
+          echo "Lib:"
+          ls -la {{ tomcat_home }}/lib/ | head -3
+          echo ""
+          echo "Datasul-report:"
+          ls -la {{ tomcat_home }}/Datasul-report/ | head -3
+        else
+          echo "WARs restaurados:"
+          ls -la {{ tomcat_home }}/webapps/*.war 2>/dev/null || echo "Nenhum WAR encontrado"
+        fi
+      become: yes
+      register: restored_files
+      
+    - name: "Log dos arquivos restaurados"
+      debug:
+        msg: "{{ restored_files.stdout }}"
+
+    - name: "Iniciar Tomcat após rollback (Ubuntu)"
+      systemd:
+        name: "{{ tomcat_service }}"
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      become: yes
+      register: rollback_tomcat_start
+      
+    - name: "Aguardar inicialização após rollback"
+      wait_for:
+        port: "{{ tomcat_port }}"
+        timeout: 600  # Rollback pode precisar de mais tempo
+        delay: 15
+        
+    - name: "Monitorar startup pós-rollback"
+      shell: |
+        echo "Monitorando inicialização pós-rollback..."
+        timeout 300 tail -f {{ tomcat_log_file }} | while read line; do
+          echo "$line"
+          if echo "$line" | grep -q "Server startup"; then
+            echo "=== STARTUP APÓS ROLLBACK COMPLETO ==="
+            break
+          fi
+        done 2>/dev/null || echo "Timeout no monitoramento"
+      become: yes
+      register: rollback_startup
+        
+    - name: "Health check pós-rollback (Ubuntu)"
+      uri:
+        url: "https://{{ ansible_default_ipv4.address }}:{{ tomcat_port }}/totvs-menu"
+        method: GET
+        status_code: [200, 302, 301]
+        validate_certs: no
+        follow_redirects: yes
+        timeout: 30
+      register: rollback_health_check
+      retries: 10
+      delay: 15
+      ignore_errors: yes
+      
+    - name: "Teste adicional pós-rollback"
+      shell: |
+        echo "=== Teste de Conectividade Pós-Rollback ==="
+        curl -k -s -o /dev/null -w "Status: %{http_code}, Time: %{time_total}s\n" \
+          "https://{{ ansible_default_ipv4.address }}:{{ tomcat_port }}/totvs-menu" || echo "Curl falhou"
+        
+        echo ""
+        echo "=== Status do Serviço ==="
+        systemctl is-active {{ tomcat_service }}
+      register: post_rollback_test
+      
+    - name: "Relatório completo de rollback"
+      debug:
+        msg: |
+          ===============================================
+          ROLLBACK COMPLETO - {{ inventory_hostname }}
+          ===============================================
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          
+          📁 BACKUP UTILIZADO:
+          - Arquivo: {{ selected_backup }}
+          - Tamanho: {{ ((backup_files.files | selectattr('path', 'equalto', selected_backup) | first).size / 1024 / 1024) | round(2) }} MB
+          
+          🔄 STATUS DO ROLLBACK:
+          - Tomcat Stop: {{ 'OK' if rollback_tomcat_stop.changed else 'ERRO' }}
+          - Backup Extraído: {{ 'OK' if 'concluída' in backup_extraction.stdout else 'ERRO' }}
+          - Tomcat Start: {{ 'OK' if rollback_tomcat_start.changed else 'ERRO' }}
+          - Health Check: {{ 'OK' if rollback_health_check.status == 200 else 'VERIFICAR - Status: ' + (rollback_health_check.status | string) }}
+          
+          🧪 TESTE PÓS-ROLLBACK:
+          {{ post_rollback_test.stdout }}
+          
+          ⚠️  BACKUP DE EMERGÊNCIA CRIADO:
+          {{ emergency_backup.stdout }}
+          
+          📋 STATUS FINAL:
+          {{ 'SUCESSO' if rollback_health_check.status == 200 else 'NECESSITA VERIFICAÇÃO MANUAL' }}
+          
+          ⏰ Timestamp: {{ ansible_date_time.iso8601 }}
+          ===============================================
+
+  post_tasks:
+    - name: "Criar relatório de rollback"
+      copy:
+        content: |
+          ROLLBACK REPORT - {{ inventory_hostname }}
+          =====================================
+          Date: {{ ansible_date_time.iso8601 }}
+          Type: {{ rollback_type | upper }} ROLLBACK
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          
+          Backup Used: {{ selected_backup }}
+          Health Check: {{ rollback_health_check.status | default('FAILED') }}
+          
+          Emergency Backup Created:
+          {{ emergency_backup.stdout }}
+          
+          Post-rollback Status:
+          {{ post_rollback_test.stdout }}
+          
+          Startup Monitoring:
+          {{ rollback_startup.stdout }}
+          
+        dest: "{{ backup_base_dir }}/emergency/{{ ansible_date_time.date }}/{{ inventory_hostname }}_rollback_report_{{ ansible_date_time.epoch }}.txt"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_user }}"
+        mode: '0644'
+      become: yes
+      
+    - name: "Log do rollback no histórico"
+      lineinfile:
+        path: "{{ fsx_mount }}/logs/deploy-history.log"
+        line: "{{ ansible_date_time.iso8601 }} - ROLLBACK {{ rollback_type | upper }} - {{ inventory_hostname }} - {{ 'SUCCESS' if rollback_health_check.status == 200 else 'NEEDS_CHECK' }}"
+        create: yes
+      delegate_to: localhost
+      run_once: true
+
+    - name: "Notificação final de rollback"
+      debug:
+        msg: |
+          🚨 ROLLBACK DE EMERGÊNCIA FINALIZADO!
+          
+          {% if rollback_health_check.status == 200 %}
+          ✅ STATUS: SUCESSO
+          - Aplicação respondendo normalmente
+          - Rollback concluído com êxito
+          {% else %}
+          ⚠️  STATUS: NECESSITA VERIFICAÇÃO
+          - Health check falhou ou incompleto
+          - Verificação manual necessária
+          {% endif %}
+          
+          📋 PRÓXIMOS PASSOS:
+          1. Teste manual completo da aplicação
+          2. Verificar logs por sinais de problemas
+          3. Confirmar integração com load balancer
+          4. Documentar causa raiz que levou ao rollback
+          
+          💾 Relatório salvo em:
+          {{ backup_base_dir }}/emergency/{{ ansible_date_time.date }}/{{ inventory_hostname }}_rollback_report_{{ ansible_date_time.epoch }}.txt

@@ -1,0 +1,30 @@
+[defaults]
+inventory = inventory.yml
+remote_user = ubuntu
+private_key_file = ~/.ssh/id_rsa
+host_key_checking = False
+timeout = 30
+gather_facts = yes
+retry_files_enabled = False
+stdout_callback = yaml
+log_path = /opt/ansible-deploys/logs/ansible.log
+
+# Performance optimizations for Ubuntu
+forks = 7
+poll_interval = 5
+gathering = smart
+fact_caching = jsonfile
+fact_caching_connection = /tmp/ansible_facts_cache
+fact_caching_timeout = 3600
+
+# Ubuntu-specific SSH optimizations
+[ssh_connection]
+ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes
+control_path = /tmp/ansible-%%h-%%p-%%r
+pipelining = True
+scp_if_ssh = smart
+transfer_method = smart
+
+# Ubuntu package manager
+[inventory]
+enable_plugins = host_list, script, auto, yaml, ini, toml

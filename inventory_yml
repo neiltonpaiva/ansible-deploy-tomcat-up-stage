@@ -1,0 +1,19 @@
+all:
+  children:
+    frontend_servers:
+      hosts:
+        tomcat-01:
+          ansible_host: 172.17.3.204
+        tomcat-02:
+          ansible_host: 172.17.3.21
+      vars:
+        # Ubuntu-specific configurations
+        ansible_user: ubuntu
+        ansible_ssh_private_key_file: ~/.ssh/id_rsa
+        ansible_ssh_port: 22
+        ansible_become: yes
+        ansible_become_method: sudo
+        ansible_python_interpreter: /usr/bin/python3
+        
+        # Ubuntu package manager
+        ansible_pkg_mgr: apt

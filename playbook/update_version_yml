@@ -1,0 +1,559 @@
+---
+- name: "Deploy Version Updates - Ubuntu Environment (webapps, Datasul-report, lib) - Preservando custom + custom_fsw"
+  hosts: frontend_servers
+  serial: 1  # Um servidor Ubuntu por vez para updates de versão
+  gather_facts: yes
+  vars:
+    deploy_timestamp: "{{ ansible_date_time.epoch }}"
+    deploy_date: "{{ ansible_date_time.date }}"
+    update_source: "{{ fsx_mount }}/staging"
+    
+  pre_tasks:
+    - name: "Verificar OS (deve ser Ubuntu)"
+      fail:
+        msg: "Este playbook é específico para Ubuntu. OS detectado: {{ ansible_distribution }}"
+      when: ansible_distribution != "Ubuntu"
+      
+    - name: "Validar sources dos updates"
+      stat:
+        path: "{{ update_source }}/{{ item }}"
+      register: version_sources
+      loop:
+        - webapps
+        - Datasul-report
+        - lib
+      delegate_to: localhost
+      run_once: true
+      
+    - name: "Verificar se todos os sources existem"
+      fail:
+        msg: "Source não encontrado: {{ update_source }}/{{ item.item }}"
+      loop: "{{ version_sources.results }}"
+      when: not item.stat.exists
+      delegate_to: localhost
+      run_once: true
+
+    - name: "Verificar espaço em disco para version update"
+      shell: |
+        available=$(df {{ tomcat_home }} | tail -1 | awk '{print $4}')
+        required=2097152  # 2GB em KB
+        if [ $available -lt $required ]; then
+          echo "INSUFFICIENT_SPACE"
+        else
+          echo "OK"
+        fi
+      register: disk_space_check
+      become: yes
+      
+    - name: "Falhar se espaço insuficiente"
+      fail:
+        msg: "Espaço em disco insuficiente para update de versão"
+      when: disk_space_check.stdout == "INSUFFICIENT_SPACE"
+
+    - name: "Confirmação de deploy de versão Ubuntu"
+      pause:
+        prompt: |
+          ==========================================
+          ATENÇÃO: DEPLOY DE VERSÃO COMPLETA UBUNTU
+          ==========================================
+          Servidor: {{ inventory_hostname }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          
+          Diretórios que serão atualizados:
+          - {{ tomcat_home }}/webapps
+          - {{ tomcat_home }}/Datasul-report  
+          - {{ tomcat_home }}/lib
+          
+          Diretórios preservados:
+          - {{ tomcat_home }}/webapps/custom
+          - {{ tomcat_home }}/webapps/custom_fsw
+          
+          Continuar? (Ctrl+C para cancelar)
+      when: inventory_hostname == play_hosts[0]  # Só pergunta uma vez
+
+  tasks:
+    - name: "Coletar informações detalhadas do Ubuntu"
+      setup:
+        filter: "ansible_distribution*,ansible_kernel,ansible_memtotal_mb,ansible_processor*"
+      
+    - name: "Exibir informações completas do servidor"
+      debug:
+        msg: |
+          ==========================================
+          INFORMAÇÕES DO SERVIDOR UBUNTU
+          ==========================================
+          Hostname: {{ inventory_hostname }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Kernel: {{ ansible_kernel }}
+          CPU: {{ ansible_processor_vcpus }} vCPUs
+          Memória: {{ ansible_memtotal_mb }}MB
+          ==========================================
+
+    - name: "Verificar diretórios custom existentes antes do deploy"
+      shell: |
+        echo "=== Diretórios Custom Pré-Deploy ==="
+        custom_found=""
+        if [ -d "{{ tomcat_home }}/webapps/custom" ]; then
+          custom_size=$(du -sh {{ tomcat_home }}/webapps/custom | cut -f1)
+          custom_files=$(find {{ tomcat_home }}/webapps/custom -type f | wc -l)
+          echo "✓ custom: $custom_size ($custom_files arquivos)"
+          custom_found="custom "
+        else
+          echo "✗ custom: não existe"
+        fi
+        
+        if [ -d "{{ tomcat_home }}/webapps/custom_fsw" ]; then
+          custom_fsw_size=$(du -sh {{ tomcat_home }}/webapps/custom_fsw | cut -f1)
+          custom_fsw_files=$(find {{ tomcat_home }}/webapps/custom_fsw -type f | wc -l)
+          echo "✓ custom_fsw: $custom_fsw_size ($custom_fsw_files arquivos)"
+          custom_found="${custom_found}custom_fsw "
+        else
+          echo "✗ custom_fsw: não existe"
+        fi
+        
+        if [ -z "$custom_found" ]; then
+          echo "ℹ️ Nenhum diretório custom encontrado para preservar"
+        else
+          echo "🔒 Serão preservados: $custom_found"
+        fi
+      become: yes
+      register: pre_deploy_custom_check
+      
+    - name: "Log da verificação pré-deploy"
+      debug:
+        msg: "{{ pre_deploy_custom_check.stdout }}"
+
+    - name: "Criar diretório de backup para versão"
+      file:
+        path: "{{ backup_base_dir }}/version/{{ deploy_date }}"
+        state: directory
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_user }}"
+        mode: '0755'
+      become: yes
+
+    - name: "Parar Tomcat para update de versão (Ubuntu)"
+      systemd:
+        name: "{{ tomcat_service }}"
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      become: yes
+      register: version_tomcat_start
+      
+    - name: "Aguardar inicialização completa (versão nova pode demorar mais)"
+      wait_for:
+        port: "{{ tomcat_port }}"
+        timeout: 900  # 15 minutos para versão nova
+        delay: 15
+        
+    - name: "Monitorar logs de inicialização (Ubuntu)"
+      shell: |
+        echo "Monitorando logs de startup..."
+        timeout 600 tail -f {{ tomcat_log_file }} | while read line; do
+          echo "$line"
+          # Condições de sucesso
+          if echo "$line" | grep -q "Server startup in"; then
+            echo "=== STARTUP COMPLETO ==="
+            break
+          fi
+          # Condições de erro
+          if echo "$line" | grep -q "SEVERE\|Exception\|Error"; then
+            echo "=== POSSÍVEL ERRO DETECTADO ==="
+          fi
+        done 2>/dev/null || echo "Timeout no monitoramento de logs"
+      become: yes
+      register: startup_monitoring
+      
+    - name: "Health check extensivo para nova versão (Ubuntu)"
+      uri:
+        url: "https://{{ ansible_default_ipv4.address }}:{{ tomcat_port }}/totvs-menu"
+        method: GET
+        status_code: [200, 302, 301]
+        timeout: 60
+        validate_certs: no
+        follow_redirects: yes
+      register: version_health_check
+      retries: 20
+      delay: 30
+      ignore_errors: yes
+      
+    - name: "Teste adicional de conectividade (Ubuntu curl)"
+      shell: |
+        echo "=== Teste de Conectividade ==="
+        curl -k -s -o /dev/null -w "Status: %{http_code}, Time: %{time_total}s\n" \
+          "https://{{ ansible_default_ipv4.address }}:{{ tomcat_port }}/totvs-menu" || echo "Curl falhou"
+        
+        echo ""
+        echo "=== Portas Abertas ==="
+        ss -tlnp | grep :{{ tomcat_port }} || echo "Porta não está em listening"
+      register: connectivity_test
+      
+    - name: "Verificar logs de erro pós-deploy"
+      shell: |
+        echo "=== Últimos Erros nos Logs ==="
+        tail -50 {{ tomcat_log_file }} | grep -i "error\|exception\|severe\|failed" | tail -10 || echo "Nenhum erro recente"
+        
+        echo ""
+        echo "=== Status dos Serviços ==="
+        systemctl status {{ tomcat_service }} --no-pager -l
+      become: yes
+      register: post_deploy_check
+      
+    - name: "Verificação final completa dos diretórios custom"
+      shell: |
+        echo "=== VERIFICAÇÃO FINAL CUSTOM DIRECTORIES ==="
+        custom_status=""
+        
+        if [ -d "{{ tomcat_home }}/webapps/custom" ]; then
+          custom_size=$(du -sh {{ tomcat_home }}/webapps/custom | cut -f1)
+          custom_files=$(find {{ tomcat_home }}/webapps/custom -type f | wc -l)
+          echo "✅ custom: $custom_size ($custom_files arquivos) - PRESERVADO"
+          custom_status="custom:OK "
+        else
+          echo "❌ custom: NÃO ENCONTRADO"
+          custom_status="custom:MISSING "
+        fi
+        
+        if [ -d "{{ tomcat_home }}/webapps/custom_fsw" ]; then
+          custom_fsw_size=$(du -sh {{ tomcat_home }}/webapps/custom_fsw | cut -f1)
+          custom_fsw_files=$(find {{ tomcat_home }}/webapps/custom_fsw -type f | wc -l)
+          echo "✅ custom_fsw: $custom_fsw_size ($custom_fsw_files arquivos) - PRESERVADO"
+          custom_status="${custom_status}custom_fsw:OK"
+        else
+          echo "❌ custom_fsw: NÃO ENCONTRADO"
+          custom_status="${custom_status}custom_fsw:MISSING"
+        fi
+        
+        echo "Status final: $custom_status"
+      become: yes
+      register: final_custom_verification
+      
+    - name: "Relatório completo de deploy de versão Ubuntu (com custom/custom_fsw)"
+      debug:
+        msg: |
+          ===============================================
+          DEPLOY DE VERSÃO COMPLETO - {{ inventory_hostname }}
+          ===============================================
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          
+          📁 BACKUPS CRIADOS:
+          - Full: {{ backup_base_dir }}/version/{{ deploy_date }}/{{ inventory_hostname }}_full_backup_{{ deploy_timestamp }}.tar.gz
+          - Custom Details: {{ custom_backup.stdout }}
+          
+          🚀 STATUS DO DEPLOY:
+          - Tomcat Stop: {{ 'OK' if version_tomcat_stop.changed else 'ERRO' }}
+          - Tomcat Start: {{ 'OK' if version_tomcat_start.changed else 'ERRO' }}
+          - Health Check: {{ 'OK' if version_health_check.status == 200 else 'VERIFICAR - Status: ' + (version_health_check.status | string) }}
+          
+          🔧 SINCRONIZAÇÕES:
+          - Webapps: {{ 'OK' if webapps_sync.changed else 'SEM ALTERAÇÕES' }}
+          - Datasul-report: {{ 'OK' if datasul_sync.changed else 'SEM ALTERAÇÕES' }}
+          - Lib: {{ 'OK' if lib_sync.changed else 'SEM ALTERAÇÕES' }}
+          
+          🔒 PRESERVAÇÃO CUSTOM:
+          {{ final_custom_verification.stdout }}
+          
+          🧪 TESTES DE CONECTIVIDADE:
+          {{ connectivity_test.stdout }}
+          
+          📋 PRÓXIMOS PASSOS:
+          1. ✅ Testar funcionalidades principais da aplicação
+          2. ✅ Verificar se custom/custom_fsw funcionam corretamente
+          3. ✅ Verificar integração com load balancer
+          4. ✅ Monitorar logs por algumas horas
+          5. ✅ Validar performance da aplicação
+          
+          ⏰ Timestamp: {{ deploy_timestamp }}
+          ===============================================
+
+  post_tasks:
+    - name: "Criar relatório detalhado de deploy em arquivo"
+      copy:
+        content: |
+          DEPLOY REPORT - VERSION UPDATE - {{ inventory_hostname }}
+          =======================================================
+          Date: {{ ansible_date_time.iso8601 }}
+          Type: VERSION UPDATE (FULL)
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          
+          BACKUPS CREATED:
+          - Full: {{ backup_base_dir }}/version/{{ deploy_date }}/{{ inventory_hostname }}_full_backup_{{ deploy_timestamp }}.tar.gz
+          - Custom backups: {{ custom_backup.stdout }}
+          
+          CUSTOM DIRECTORIES STATUS:
+          {{ final_custom_verification.stdout }}
+          
+          HEALTH CHECK: {{ version_health_check.status | default('FAILED') }}
+          
+          PRE-DEPLOY CUSTOM STATUS:
+          {{ pre_deploy_custom_check.stdout }}
+          
+          CUSTOM RESTORE STATUS:
+          {{ custom_restore.stdout }}
+          
+          POST-DEPLOYMENT CHECKS:
+          {{ post_deploy_check.stdout }}
+          
+          STARTUP MONITORING:
+          {{ startup_monitoring.stdout }}
+          
+        dest: "{{ backup_base_dir }}/version/{{ deploy_date }}/{{ inventory_hostname }}_deploy_report_{{ deploy_timestamp }}.txt"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_user }}"
+        mode: '0644'
+      become: yes
+      
+    - name: "Log final do deploy de versão"
+      lineinfile:
+        path: "{{ fsx_mount }}/logs/deploy-history.log"
+        line: "{{ ansible_date_time.iso8601 }} - VERSION Deploy - {{ inventory_hostname }} - {{ 'SUCCESS' if version_health_check.status == 200 else 'NEEDS_CHECK' }} - custom+custom_fsw preserved"
+        create: yes
+      delegate_to: localhost
+      run_once: true
+
+    - name: "Notificação final com status custom"
+      debug:
+        msg: |
+          🎉 DEPLOY DE VERSÃO FINALIZADO!
+          
+          {{ final_custom_verification.stdout }}
+          
+          ⚠️  IMPORTANTE:
+          - Teste a aplicação completamente antes de prosseguir
+          - VERIFIQUE se custom e custom_fsw estão funcionando
+          - Monitore logs por pelo menos 1 hora
+          - Em caso de problemas, execute rollback imediatamente
+          - Backup completo disponível para rollback de emergência
+          
+          📄 Relatório detalhado salvo em:
+          {{ backup_base_dir }}/version/{{ deploy_date }}/{{ inventory_hostname }}_deploy_report_{{ deploy_timestamp }}.txt
+        state: stopped
+      become: yes
+      register: version_tomcat_stop
+      
+    - name: "Aguardar Tomcat parar completamente"
+      wait_for:
+        port: "{{ tomcat_port }}"
+        state: stopped
+        timeout: 120
+
+    - name: "Verificar e encerrar processos restantes (Ubuntu)"
+      shell: |
+        pids=$(pgrep -f "{{ tomcat_home }}")
+        if [ -n "$pids" ]; then
+          echo "Encerrando processos restantes: $pids"
+          kill -15 $pids
+          sleep 10
+          # Force kill se ainda existir
+          remaining=$(pgrep -f "{{ tomcat_home }}")
+          if [ -n "$remaining" ]; then
+            echo "Force killing: $remaining"
+            kill -9 $remaining
+          fi
+        else
+          echo "Nenhum processo Tomcat encontrado"
+        fi
+      become: yes
+
+    - name: "Backup completo da versão atual"
+      shell: |
+        cd {{ tomcat_home }}
+        echo "Criando backup completo..."
+        tar -czf {{ backup_base_dir }}/version/{{ deploy_date }}/{{ inventory_hostname }}_full_backup_{{ deploy_timestamp }}.tar.gz \
+          webapps Datasul-report lib
+        
+        # Verificar tamanho do backup
+        backup_size=$(du -h {{ backup_base_dir }}/version/{{ deploy_date }}/{{ inventory_hostname }}_full_backup_{{ deploy_timestamp }}.tar.gz | cut -f1)
+        echo "Backup completo criado: $backup_size"
+      become: yes
+      register: full_backup_result
+      
+    - name: "Log do backup completo"
+      debug:
+        msg: "{{ full_backup_result.stdout }}"
+      
+    - name: "Backup específico dos diretórios custom e custom_fsw"
+      shell: |
+        backup_created=""
+        cd {{ tomcat_home }}/webapps
+        
+        # Backup do custom
+        if [ -d "custom" ]; then
+          tar -czf {{ backup_base_dir }}/version/{{ deploy_date }}/{{ inventory_hostname }}_custom_{{ deploy_timestamp }}.tar.gz custom/
+          custom_size=$(du -h {{ backup_base_dir }}/version/{{ deploy_date }}/{{ inventory_hostname }}_custom_{{ deploy_timestamp }}.tar.gz | cut -f1)
+          backup_created="custom($custom_size) "
+          echo "✓ Backup custom criado: $custom_size"
+        else
+          echo "✗ custom não existe para backup"
+        fi
+        
+        # Backup do custom_fsw
+        if [ -d "custom_fsw" ]; then
+          tar -czf {{ backup_base_dir }}/version/{{ deploy_date }}/{{ inventory_hostname }}_custom_fsw_{{ deploy_timestamp }}.tar.gz custom_fsw/
+          custom_fsw_size=$(du -h {{ backup_base_dir }}/version/{{ deploy_date }}/{{ inventory_hostname }}_custom_fsw_{{ deploy_timestamp }}.tar.gz | cut -f1)
+          backup_created="${backup_created}custom_fsw($custom_fsw_size) "
+          echo "✓ Backup custom_fsw criado: $custom_fsw_size"
+        else
+          echo "✗ custom_fsw não existe para backup"
+        fi
+        
+        if [ -n "$backup_created" ]; then
+          echo "🔒 Backups custom criados: $backup_created"
+        else
+          echo "ℹ️ Nenhum diretório custom para backup"
+        fi
+      become: yes
+      register: custom_backup
+      
+    - name: "Limpar diretórios atuais (preservando custom/custom_fsw temporariamente)"
+      shell: |
+        echo "🔒 Preservando diretórios custom temporariamente..."
+        
+        # Preservar custom temporariamente
+        if [ -d "{{ tomcat_home }}/webapps/custom" ]; then
+          echo "Movendo custom para /tmp/custom_temp_{{ deploy_timestamp }}"
+          cp -r {{ tomcat_home }}/webapps/custom /tmp/custom_temp_{{ deploy_timestamp }}
+          echo "✓ custom preservado temporariamente"
+        fi
+        
+        # Preservar custom_fsw temporariamente
+        if [ -d "{{ tomcat_home }}/webapps/custom_fsw" ]; then
+          echo "Movendo custom_fsw para /tmp/custom_fsw_temp_{{ deploy_timestamp }}"
+          cp -r {{ tomcat_home }}/webapps/custom_fsw /tmp/custom_fsw_temp_{{ deploy_timestamp }}
+          echo "✓ custom_fsw preservado temporariamente"
+        fi
+        
+        echo "🗑️ Limpando diretórios para nova versão..."
+        rm -rf {{ tomcat_home }}/webapps/*
+        rm -rf {{ tomcat_home }}/Datasul-report/*  
+        rm -rf {{ tomcat_home }}/lib/*
+        
+        echo "✅ Diretórios limpos (custom/custom_fsw preservados temporariamente)"
+      become: yes
+      register: cleanup_result
+      
+    - name: "Log da limpeza"
+      debug:
+        msg: "{{ cleanup_result.stdout }}"
+      
+    - name: "Atualizar webapps (Ubuntu rsync)"
+      synchronize:
+        src: "{{ update_source }}/webapps/"
+        dest: "{{ tomcat_home }}/webapps/"
+        delete: yes
+        rsync_opts:
+          - "--chown={{ tomcat_user }}:{{ tomcat_user }}"
+          - "--chmod=755"
+        mode: push
+      become: yes
+      register: webapps_sync
+      
+    - name: "Atualizar Datasul-report (Ubuntu rsync)"
+      synchronize:
+        src: "{{ update_source }}/Datasul-report/"
+        dest: "{{ tomcat_home }}/Datasul-report/"
+        delete: yes
+        rsync_opts:
+          - "--chown={{ tomcat_user }}:{{ tomcat_user }}"
+          - "--chmod=755"
+        mode: push
+      become: yes
+      register: datasul_sync
+      
+    - name: "Atualizar lib (Ubuntu rsync)"
+      synchronize:
+        src: "{{ update_source }}/lib/"
+        dest: "{{ tomcat_home }}/lib/"
+        delete: yes
+        rsync_opts:
+          - "--chown={{ tomcat_user }}:{{ tomcat_user }}"
+          - "--chmod=755"
+        mode: push
+      become: yes
+      register: lib_sync
+      
+    - name: "Restaurar diretórios custom e custom_fsw"
+      shell: |
+        restored=""
+        
+        # Restaurar custom
+        if [ -d "/tmp/custom_temp_{{ deploy_timestamp }}" ]; then
+          echo "Restaurando custom..."
+          mv /tmp/custom_temp_{{ deploy_timestamp }} {{ tomcat_home }}/webapps/custom
+          chown -R {{ tomcat_user }}:{{ tomcat_user }} {{ tomcat_home }}/webapps/custom
+          chmod -R 755 {{ tomcat_home }}/webapps/custom
+          custom_files=$(find {{ tomcat_home }}/webapps/custom -type f | wc -l)
+          restored="custom($custom_files arquivos) "
+          echo "✓ custom restaurado com $custom_files arquivos"
+        else
+          echo "✗ custom não encontrado para restaurar"
+        fi
+        
+        # Restaurar custom_fsw
+        if [ -d "/tmp/custom_fsw_temp_{{ deploy_timestamp }}" ]; then
+          echo "Restaurando custom_fsw..."
+          mv /tmp/custom_fsw_temp_{{ deploy_timestamp }} {{ tomcat_home }}/webapps/custom_fsw
+          chown -R {{ tomcat_user }}:{{ tomcat_user }} {{ tomcat_home }}/webapps/custom_fsw
+          chmod -R 755 {{ tomcat_home }}/webapps/custom_fsw
+          custom_fsw_files=$(find {{ tomcat_home }}/webapps/custom_fsw -type f | wc -l)
+          restored="${restored}custom_fsw($custom_fsw_files arquivos) "
+          echo "✓ custom_fsw restaurado com $custom_fsw_files arquivos"
+        else
+          echo "✗ custom_fsw não encontrado para restaurar"
+        fi
+        
+        if [ -n "$restored" ]; then
+          echo "🎉 Diretórios restaurados com sucesso: $restored"
+        else
+          echo "ℹ️ Nenhum diretório custom para restaurar"
+        fi
+      become: yes
+      register: custom_restore
+      
+    - name: "Verificar arquivos atualizados"
+      shell: |
+        echo "=== Verificação da Nova Versão ==="
+        echo "Webapps:"
+        ls -la {{ tomcat_home }}/webapps/ | head -10
+        echo ""
+        echo "Lib:"
+        ls -la {{ tomcat_home }}/lib/ | head -5
+        echo ""
+        echo "Datasul-report:"
+        ls -la {{ tomcat_home }}/Datasul-report/ | head -5
+        echo ""
+        echo "=== Custom Directories Status ==="
+        if [ -d "{{ tomcat_home }}/webapps/custom" ]; then
+          echo "✓ custom: $(ls {{ tomcat_home }}/webapps/custom/ | wc -l) arquivos"
+        else
+          echo "✗ custom: não encontrado"
+        fi
+        if [ -d "{{ tomcat_home }}/webapps/custom_fsw" ]; then
+          echo "✓ custom_fsw: $(ls {{ tomcat_home }}/webapps/custom_fsw/ | wc -l) arquivos"
+        else
+          echo "✗ custom_fsw: não encontrado"
+        fi
+      become: yes
+      register: files_verification
+      
+    - name: "Log da verificação de arquivos"
+      debug:
+        msg: "{{ files_verification.stdout }}"
+      
+    - name: "Definir permissões finais (Ubuntu)"
+      file:
+        path: "{{ item }}"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_user }}"
+        mode: '0755'
+        recurse: yes
+      loop:
+        - "{{ tomcat_home }}/webapps"
+        - "{{ tomcat_home }}/Datasul-report"
+        - "{{ tomcat_home }}/lib"
+      become: yes
+      
+    - name: "Iniciar Tomcat após update de versão (Ubuntu)"
+      systemd:
+        name: "{{ tomcat_service }}"
