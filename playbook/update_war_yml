@@ -1,32 +1,51 @@
 ---
-- name: "Deploy WAR Updates - Ubuntu Environment (preservando custom + custom_fsw)"
+- name: "Deploy WAR Updates - Estrutura Simples (preservando custom + custom_fsw)"
   hosts: frontend_servers
-  serial: "{{ deployment_batch_size | default(2) }}"  # 2 servidores Ubuntu por vez
+  serial: "{{ deployment_batch_size | default(2) }}"  # 2 servidores por vez
   gather_facts: yes
   vars:
     deploy_timestamp: "{{ ansible_date_time.epoch }}"
     deploy_date: "{{ ansible_date_time.date }}"
-    update_source: "{{ fsx_mount }}/staging"
+    war_source: "{{ fsx_mount }}/staging/war"  # ← Diretório fixo
     
   pre_tasks:
-    - name: "Verificar OS (deve ser Ubuntu)"
-      fail:
-        msg: "Este playbook é específico para Ubuntu. OS detectado: {{ ansible_distribution }}"
-      when: ansible_distribution != "Ubuntu"
-      
-    - name: "Validar source dos updates"
+    - name: "Validar se diretório WAR existe"
       stat:
-        path: "{{ update_source }}/webapps"
-      register: war_source
+        path: "{{ war_source }}"
+      register: war_dir
       delegate_to: localhost
       run_once: true
       
-    - name: "Falhar se source não existir"
+    - name: "Falhar se diretório WAR não existir"
       fail:
-        msg: "Source de WAR não encontrado: {{ update_source }}/webapps"
-      when: not war_source.stat.exists
+        msg: "Diretório WAR não encontrado: {{ war_source }}"
+      when: not war_dir.stat.exists
       delegate_to: localhost
       run_once: true
+
+    - name: "Verificar se há arquivos WAR no diretório"
+      find:
+        paths: "{{ war_source }}"
+        patterns: ["*.war", "*.WAR"]
+      register: war_files
+      delegate_to: localhost
+      run_once: true
+      
+    - name: "Falhar se não há WARs para deploy"
+      fail:
+        msg: "Nenhum arquivo .war ou .WAR encontrado em {{ war_source }}"
+      when: war_files.files | length == 0
+      delegate_to: localhost
+      run_once: true
+
+    - name: "Listar arquivos WAR encontrados"
+      debug:
+        msg: |
+          Arquivos WAR encontrados para deploy:
+          {% for file in war_files.files %}
+          - {{ file.path | basename }} ({{ (file.size / 1024 / 1024) | round(2) }} MB)
+          {% endfor %}
+          Total: {{ war_files.files | length }} arquivo(s)
 
     - name: "Verificar espaço em disco disponível"
       shell: df -h {{ tomcat_home }} | tail -1 | awk '{print $5}' | sed 's/%//'
@@ -39,7 +58,7 @@
       when: disk_usage.stdout | int > 85
 
   tasks:
-    - name: "Coletar informações do sistema Ubuntu"
+    - name: "Coletar informações do sistema"
       setup:
         filter: "ansible_distribution*,ansible_kernel,ansible_memtotal_mb"
       
@@ -86,17 +105,22 @@
       register: tomcat_initial_status
       become: yes
 
-    - name: "Backup dos WARs atuais (excluindo custom e custom_fsw)"
+    - name: "Backup dos WARs atuais (case-insensitive)"
       shell: |
         cd {{ tomcat_home }}/webapps
-        if ls *.war 1> /dev/null 2>&1; then
+        # Buscar tanto .war quanto .WAR
+        war_files=$(find . -maxdepth 1 \( -name "*.war" -o -name "*.WAR" \) -not -path "./custom/*" -not -path "./custom_fsw/*" 2>/dev/null)
+        if [ -n "$war_files" ]; then
           tar -czf {{ backup_base_dir }}/{{ deploy_date }}/{{ inventory_hostname }}_webapps_{{ deploy_timestamp }}.tar.gz \
             --exclude=custom \
             --exclude=custom_fsw \
-            *.war
-          echo "Backup criado com $(ls *.war | wc -l) arquivos WAR (preservando custom/custom_fsw)"
+            $war_files
+          war_count=$(echo $war_files | wc -w)
+          echo "Backup criado com $war_count arquivos WAR (preservando custom/custom_fsw)"
         else
-          echo "Nenhum WAR encontrado para backup"
+          echo "Nenhum arquivo WAR/war encontrado para backup"
+          # Criar backup vazio para consistência
+          tar -czf {{ backup_base_dir }}/{{ deploy_date }}/{{ inventory_hostname }}_webapps_{{ deploy_timestamp }}.tar.gz --files-from /dev/null
         fi
       become: yes
       register: backup_result
@@ -105,7 +129,7 @@
       debug:
         msg: "{{ backup_result.stdout }}"
       
-    - name: "Parar Tomcat gracefully (Ubuntu systemd)"
+    - name: "Parar Tomcat gracefully"
       systemd:
         name: "{{ tomcat_service }}"
         state: stopped
@@ -118,13 +142,13 @@
         state: stopped
         timeout: "{{ service_management.stop_timeout | default(60) }}"
         
-    - name: "Verificar se processo Tomcat foi finalizado (Ubuntu)"
+    - name: "Verificar se processo Tomcat foi finalizado"
       shell: |
         pgrep -f "{{ tomcat_home }}" || echo "Nenhum processo Tomcat encontrado"
       register: tomcat_processes
       become: yes
       
-    - name: "Forçar kill se necessário (Ubuntu)"
+    - name: "Forçar kill se necessário"
       shell: |
         pids=$(pgrep -f "{{ tomcat_home }}")
         if [ -n "$pids" ]; then
@@ -137,7 +161,7 @@
       become: yes
       when: tomcat_processes.stdout != "Nenhum processo Tomcat encontrado"
       
-    - name: "Remover WARs antigos (preservando custom e custom_fsw)"
+    - name: "Remover WARs antigos (preservando custom e custom_fsw - case-insensitive)"
       shell: |
         cd {{ tomcat_home }}/webapps
         
@@ -149,8 +173,9 @@
           echo "Preservando diretório custom_fsw"
         fi
         
-        # Remover WARs (excluindo custom e custom_fsw)
-        find . -maxdepth 1 -name "*.war" -not -path "./custom/*" -not -path "./custom_fsw/*" -delete
+        # Remover WARs (tanto .war quanto .WAR - excluindo custom e custom_fsw)
+        find . -maxdepth 1 \( -name "*.war" -o -name "*.WAR" \) \
+          -not -path "./custom/*" -not -path "./custom_fsw/*" -delete
         
         # Remover diretórios expandidos (exceto custom, custom_fsw e ROOT)
         find . -maxdepth 1 -type d \
@@ -163,26 +188,46 @@
         echo "Limpeza concluída (custom e custom_fsw preservados)"
       become: yes
 
-    - name: "Sincronizar novos WARs do FSx (Ubuntu rsync)"
-      synchronize:
-        src: "{{ update_source }}/webapps/"
-        dest: "{{ tomcat_home }}/webapps/"
-        delete: no  # Não deletar custom/custom_fsw
-        rsync_opts:
-          - "--exclude=custom"
-          - "--exclude=custom_fsw"
-          - "--chown={{ tomcat_user }}:{{ tomcat_user }}"
-          - "--chmod=755"
-        mode: push
+    - name: "Copiar novos WARs do FSx (case-insensitive)"
+      shell: |
+        echo "Copiando WARs de {{ war_source }} para {{ tomcat_home }}/webapps/"
+        
+        # Copiar tanto .war quanto .WAR
+        cd {{ war_source }}
+        for war_file in *.war *.WAR; do
+          if [ -f "$war_file" ]; then
+            echo "Copiando: $war_file"
+            cp "$war_file" {{ tomcat_home }}/webapps/
+          fi
+        done 2>/dev/null || echo "Nenhum arquivo WAR para copiar"
+        
+        # Definir permissões
+        chown {{ tomcat_user }}:{{ tomcat_user }} {{ tomcat_home }}/webapps/*.war {{ tomcat_home }}/webapps/*.WAR 2>/dev/null || true
+        chmod 644 {{ tomcat_home }}/webapps/*.war {{ tomcat_home }}/webapps/*.WAR 2>/dev/null || true
+        
+        echo "Cópia concluída"
       become: yes
-      register: sync_result
+      register: copy_result
       
-    - name: "Verificar arquivos sincronizados"
+    - name: "Log da cópia"
+      debug:
+        msg: "{{ copy_result.stdout }}"
+      
+    - name: "Verificar arquivos copiados (case-insensitive)"
       shell: |
         cd {{ tomcat_home }}/webapps
-        echo "Arquivos WAR após sincronização:"
-        ls -la *.war 2>/dev/null || echo "Nenhum arquivo WAR encontrado"
-        echo "Total de WARs: $(find . -name '*.war' | wc -l)"
+        echo "Arquivos WAR após cópia:"
+        # Listar tanto .war quanto .WAR
+        war_list=$(ls *.war *.WAR 2>/dev/null || echo "")
+        if [ -n "$war_list" ]; then
+          ls -la *.war *.WAR 2>/dev/null
+        else
+          echo "ERRO: Nenhum arquivo WAR encontrado após cópia!"
+        fi
+        
+        # Contar todos os WARs
+        war_count=$(find . -maxdepth 1 \( -name "*.war" -o -name "*.WAR" \) | wc -l)
+        echo "Total de WARs: $war_count"
         echo ""
         echo "Diretórios preservados:"
         if [ -d "custom" ]; then
@@ -194,11 +239,11 @@
       become: yes
       register: war_count
       
-    - name: "Log da sincronização"
+    - name: "Log da verificação"
       debug:
         msg: "{{ war_count.stdout }}"
       
-    - name: "Definir permissões corretas (Ubuntu)"
+    - name: "Definir permissões corretas"
       file:
         path: "{{ tomcat_home }}/webapps"
         owner: "{{ tomcat_user }}"
@@ -207,7 +252,7 @@
         recurse: yes
       become: yes
       
-    - name: "Iniciar Tomcat (Ubuntu systemd)"
+    - name: "Iniciar Tomcat"
       systemd:
         name: "{{ tomcat_service }}"
         state: started
@@ -216,13 +261,13 @@
       become: yes
       register: tomcat_start
       
-    - name: "Aguardar Tomcat inicializar (Ubuntu)"
+    - name: "Aguardar Tomcat inicializar"
       wait_for:
         port: "{{ tomcat_port }}"
         timeout: "{{ deploy_timeout }}"
         delay: 10
         
-    - name: "Aguardar deploy dos WARs (monitoring logs Ubuntu)"
+    - name: "Aguardar deploy dos WARs (monitoring logs)"
       shell: |
         timeout 300 tail -f {{ tomcat_log_file }} | while read line; do
           echo "$line"
@@ -232,7 +277,7 @@
       become: yes
       register: war_deployment
       
-    - name: "Health check da aplicação (Ubuntu curl)"
+    - name: "Health check da aplicação"
       uri:
         url: "https://{{ ansible_default_ipv4.address }}:{{ tomcat_port }}/totvs-menu"
         method: GET
@@ -245,44 +290,14 @@
       delay: "{{ health_check_delay }}"
       ignore_errors: yes
       
-    - name: "Verificar logs de erro no Tomcat (Ubuntu)"
+    - name: "Verificar logs de erro no Tomcat"
       shell: |
         tail -100 {{ tomcat_log_file }} | grep -i "error\|exception\|failed\|severe" | tail -5 || echo "Nenhum erro recente encontrado"
       become: yes
       register: tomcat_errors
       ignore_errors: yes
       
-    - name: "Verificar uso de recursos pós-deploy (Ubuntu)"
-      shell: |
-        echo "=== Uso de Memória ==="
-        free -h
-        echo ""
-        echo "=== Uso de CPU ==="
-        top -bn1 | grep "load average" 
-        echo ""
-        echo "=== Processos Java ==="
-        pgrep -fl java || echo "Nenhum processo Java encontrado"
-      register: resource_usage
-      become: yes
-      
-    - name: "Verificação final dos diretórios custom"
-      shell: |
-        cd {{ tomcat_home }}/webapps
-        echo "=== Verificação Final Custom ==="
-        if [ -d "custom" ]; then
-          echo "✓ custom preservado: $(ls custom/ | wc -l) arquivos"
-        else
-          echo "✗ custom não encontrado"
-        fi
-        if [ -d "custom_fsw" ]; then
-          echo "✓ custom_fsw preservado: $(ls custom_fsw/ | wc -l) arquivos"
-        else
-          echo "✗ custom_fsw não encontrado"
-        fi
-      become: yes
-      register: final_custom_check
-      
-    - name: "Relatório de deploy Ubuntu (com custom/custom_fsw)"
+    - name: "Relatório de deploy completo"
       debug:
         msg: |
           ===============================================
@@ -292,13 +307,12 @@
           Status Tomcat: {{ 'OK' if tomcat_start.changed else 'ERRO' }}
           Health Check: {{ 'OK' if health_check_result.status == 200 else 'ALERTA - Status: ' + (health_check_result.status | string) }}
           Backup: {{ backup_base_dir }}/{{ deploy_date }}/{{ inventory_hostname }}_webapps_{{ deploy_timestamp }}.tar.gz
+          Source: {{ war_source }}
+          Arquivos: {{ war_files.files | length }} WARs
           Timestamp: {{ deploy_timestamp }}
           
-          🔒 Diretórios Preservados:
-          {{ final_custom_check.stdout }}
-          
-          Recursos pós-deploy:
-          {{ resource_usage.stdout }}
+          🔒 Custom preservados: custom + custom_fsw
+          📦 Deploy: Estrutura simples FSx
           
           {% if tomcat_errors.stdout and tomcat_errors.stdout != "Nenhum erro recente encontrado" %}
           ⚠️ Erros encontrados nos logs:
@@ -307,7 +321,7 @@
           ===============================================
 
   post_tasks:
-    - name: "Limpeza de backups antigos (Ubuntu find)"
+    - name: "Limpeza de backups antigos"
       find:
         paths: "{{ backup_base_dir }}"
         age: "{{ backup_retention_days }}d"
@@ -327,7 +341,7 @@
     - name: "Log final do deploy"
       lineinfile:
         path: "{{ fsx_mount }}/logs/deploy-history.log"
-        line: "{{ ansible_date_time.iso8601 }} - WAR Deploy - {{ inventory_hostname }} - SUCCESS - custom+custom_fsw preserved"
+        line: "{{ ansible_date_time.iso8601 }} - WAR Deploy - {{ inventory_hostname }} - SUCCESS - simple structure - {{ war_files.files | length }} files"
         create: yes
       delegate_to: localhost
       run_once: true
