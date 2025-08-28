@@ -1,5 +1,5 @@
 #!/bin/bash
-# Deploy Manager Script for Ubuntu Environment
+# Deploy Manager Script for Ubuntu Environment - Simple Structure
 
 set -euo pipefail
 
@@ -113,54 +113,87 @@ show_system_info() {
     echo ""
 }
 
-# Listar updates disponíveis no FSx
+# Listar updates disponíveis - ESTRUTURA SIMPLES
 list_updates() {
-    echo -e "${BLUE}=== Updates Disponíveis no FSx (Ubuntu) ===${NC}"
+    echo -e "${BLUE}=== Updates Disponíveis (Estrutura Simples) ===${NC}"
     echo
     
+    # Verificar diretório staging
     if [ ! -d "$FSX_MOUNT/staging" ]; then
         warn "Diretório staging não encontrado no FSx"
-        info "Certifique-se de fazer upload dos updates primeiro"
+        info "Criando estrutura básica..."
+        mkdir -p "$FSX_MOUNT/staging/war"
+        mkdir -p "$FSX_MOUNT/staging/version"/{webapps,Datasul-report,lib}
         return 1
     fi
     
     # WAR Updates
     echo -e "${GREEN}📦 WAR Updates:${NC}"
-    if find "$FSX_MOUNT/staging" -maxdepth 2 -name "war-*" -type d 2>/dev/null | grep -q .; then
-        find "$FSX_MOUNT/staging" -maxdepth 2 -name "war-*" -type d -printf "  %P" -exec sh -c 'echo " ($(du -sh "$1" | cut -f1))"' _ {} \; 2>/dev/null | sort -r
+    if [ -d "$FSX_MOUNT/staging/war" ]; then
+        local war_count=$(find "$FSX_MOUNT/staging/war" -name "*.war" -o -name "*.WAR" 2>/dev/null | wc -l)
+        if [ "$war_count" -gt 0 ]; then
+            echo "  📁 Diretório: $FSX_MOUNT/staging/war/"
+            echo "  📦 Arquivos disponíveis:"
+            find "$FSX_MOUNT/staging/war" \( -name "*.war" -o -name "*.WAR" \) -printf "    • %f (%s bytes)\n" 2>/dev/null
+            echo "  📊 Total: $war_count arquivo(s) WAR"
+            local war_size=$(du -sh "$FSX_MOUNT/staging/war" 2>/dev/null | cut -f1)
+            echo "  💾 Tamanho total: $war_size"
+        else
+            echo "  📭 Nenhum arquivo WAR encontrado em $FSX_MOUNT/staging/war/"
+        fi
     else
-        echo "  Nenhum update WAR encontrado"
+        echo "  ❌ Diretório war não encontrado"
+        info "Criando: mkdir -p $FSX_MOUNT/staging/war"
+        mkdir -p "$FSX_MOUNT/staging/war"
     fi
     echo
     
-    # Version Updates
+    # Version Updates  
     echo -e "${GREEN}🔄 Version Updates:${NC}"
-    if find "$FSX_MOUNT/staging" -maxdepth 2 -name "version-*" -type d 2>/dev/null | grep -q .; then
-        find "$FSX_MOUNT/staging" -maxdepth 2 -name "version-*" -type d -printf "  %P" -exec sh -c 'echo " ($(du -sh "$1" | cut -f1))"' _ {} \; 2>/dev/null | sort -r
+    if [ -d "$FSX_MOUNT/staging/version" ]; then
+        echo "  📁 Diretório: $FSX_MOUNT/staging/version/"
+        
+        # Verificar webapps
+        local webapps_count=0
+        if [ -d "$FSX_MOUNT/staging/version/webapps" ]; then
+            webapps_count=$(find "$FSX_MOUNT/staging/version/webapps" \( -name "*.war" -o -name "*.WAR" \) 2>/dev/null | wc -l)
+            echo "    📦 webapps/: $webapps_count WARs"
+        fi
+        
+        # Verificar Datasul-report
+        local datasul_count=0
+        if [ -d "$FSX_MOUNT/staging/version/Datasul-report" ]; then
+            datasul_count=$(find "$FSX_MOUNT/staging/version/Datasul-report" -type f 2>/dev/null | wc -l)
+            echo "    📋 Datasul-report/: $datasul_count arquivos"
+        fi
+        
+        # Verificar lib
+        local lib_count=0
+        if [ -d "$FSX_MOUNT/staging/version/lib" ]; then
+            lib_count=$(find "$FSX_MOUNT/staging/version/lib" -name "*.jar" 2>/dev/null | wc -l)
+            echo "    📚 lib/: $lib_count JARs"
+        fi
+        
+        # Status geral
+        local total_files=$((webapps_count + datasul_count + lib_count))
+        if [ "$total_files" -gt 0 ]; then
+            local version_size=$(du -sh "$FSX_MOUNT/staging/version" 2>/dev/null | cut -f1)
+            echo "  📊 Total: $total_files arquivo(s), $version_size"
+            echo "  ✅ Pronto para deploy de versão"
+        else
+            echo "  📭 Nenhum arquivo encontrado para deploy de versão"
+        fi
     else
-        echo "  Nenhum update de versão encontrado"
+        echo "  ❌ Diretório version não encontrado"
+        info "Criando estrutura: mkdir -p $FSX_MOUNT/staging/version/{webapps,Datasul-report,lib}"
+        mkdir -p "$FSX_MOUNT/staging/version"/{webapps,Datasul-report,lib}
     fi
     echo
     
-    # Triggers pendentes
-    if [ -d "$FSX_MOUNT/triggers" ] && ls "$FSX_MOUNT/triggers"/*.json >/dev/null 2>&1; then
-        echo -e "${YELLOW}⚠️  Triggers Pendentes:${NC}"
-        for trigger in "$FSX_MOUNT/triggers"/*.json; do
-            [ -f "$trigger" ] || continue
-            filename=$(basename "$trigger" .json)
-            echo -e "  📋 ${CYAN}$filename${NC}"
-            if command -v jq >/dev/null 2>&1; then
-                echo "     Type: $(jq -r '.UpdateType' "$trigger")"
-                echo "     Size: $(numfmt --to=iec "$(jq -r '.Size' "$trigger")" 2>/dev/null || echo "N/A")"
-                echo "     User: $(jq -r '.User' "$trigger")"
-                echo "     Time: $(jq -r '.Timestamp' "$trigger")"
-                echo "     Machine: $(jq -r '.Machine' "$trigger")"
-            fi
-            echo
-        done
-    else
-        echo -e "${CYAN}ℹ️  Nenhum trigger pendente${NC}"
-    fi
+    # Instruções
+    echo -e "${CYAN}💡 Como usar:${NC}"
+    echo "  Para WAR: Salve arquivos .war/.WAR em $FSX_MOUNT/staging/war/"
+    echo "  Para Versão: Organize arquivos em $FSX_MOUNT/staging/version/{webapps,Datasul-report,lib}/"
 }
 
 # Health check do cluster Ubuntu
@@ -189,131 +222,160 @@ health_check() {
     ansible -i inventory.yml frontend_servers -m shell -a "free -h | grep Mem | awk '{print \"RAM: \" \$3 \"/\" \$2}' && uptime | awk '{print \"Load: \" \$(NF-2) \" \" \$(NF-1) \" \" \$NF}'" --one-line
     echo
     
-    echo -e "${BLUE}=== Versão do Sistema ===${NC}"
-    ansible -i inventory.yml frontend_servers -m shell -a "lsb_release -d | cut -f2 && uname -r" --one-line
-    echo
-    
     echo -e "${BLUE}=== Health Check das Aplicações ===${NC}"
     ansible -i inventory.yml frontend_servers -m shell -a "curl -k -s -o /dev/null -w 'HTTP: %{http_code}, Time: %{time_total}s' https://localhost:8080/totvs-menu 2>/dev/null || echo 'Health check falhou'" --one-line
 }
 
-# Deploy de WAR com validações Ubuntu
+# Deploy de WAR com estrutura simples
 deploy_war() {
-    local update_path=$1
-    local full_path="$FSX_MOUNT/staging/$update_path"
+    log "🚀 Deploy WAR (Estrutura Simples)"
     
-    if [ ! -d "$full_path" ]; then
-        error "Update não encontrado: $update_path"
+    # Verificar se diretório war existe
+    if [ ! -d "$FSX_MOUNT/staging/war" ]; then
+        error "Diretório WAR não encontrado: $FSX_MOUNT/staging/war"
+        info "Execute 'list' para criar a estrutura"
         return 1
     fi
+    
+    # Verificar se há arquivos WAR
+    local war_count=$(find "$FSX_MOUNT/staging/war" \( -name "*.war" -o -name "*.WAR" \) 2>/dev/null | wc -l)
+    if [ "$war_count" -eq 0 ]; then
+        error "Nenhum arquivo WAR encontrado em $FSX_MOUNT/staging/war/"
+        info "Copie seus arquivos .war ou .WAR para o diretório antes de executar o deploy"
+        return 1
+    fi
+    
+    # Mostrar arquivos que serão deployados
+    echo -e "${CYAN}📦 Arquivos que serão deployados:${NC}"
+    find "$FSX_MOUNT/staging/war" \( -name "*.war" -o -name "*.WAR" \) -printf "  • %f (%s bytes)\n" 2>/dev/null
+    echo "  📊 Total: $war_count arquivo(s)"
+    echo
     
     # Validações pré-deploy
-    log "Validando update WAR para Ubuntu..."
+    log "Validando ambiente para deploy WAR..."
     
-    if [ ! -d "$full_path/webapps" ]; then
-        error "Diretório webapps não encontrado em $full_path"
-        return 1
-    fi
-    
-    local war_count=$(find "$full_path/webapps" -name "*.war" | wc -l)
-    if [ "$war_count" -eq 0 ]; then
-        error "Nenhum arquivo WAR encontrado"
-        return 1
-    fi
-    
-    info "Encontrados $war_count arquivos WAR para deploy"
-    
-    # Verificar espaço em disco nos servidores
-    log "Verificando espaço em disco nos servidores Ubuntu..."
+    # Verificar conectividade
     cd "$ANSIBLE_DIR"
-    if ! ansible -i inventory.yml frontend_servers -m shell -a "df /opt/tomcat | tail -1 | awk '{if(\$5+0 > 80) exit 1}'" >/dev/null; then
-        warn "Alguns servidores com pouco espaço em disco (>80%)"
+    if ! ansible -i inventory.yml frontend_servers -m ping >/dev/null 2>&1; then
+        error "Falha na conectividade com os servidores"
+        return 1
+    fi
+    
+    # Verificar espaço em disco
+    if ! ansible -i inventory.yml frontend_servers -m shell -a "df /opt/tomcat | tail -1 | awk '{if(\$5+0 > 85) exit 1}'" >/dev/null 2>&1; then
+        warn "Alguns servidores com pouco espaço em disco (>85%)"
         read -p "Continuar mesmo assim? (y/N): " -n 1 -r
         echo
         [[ ! $REPLY =~ ^[Yy]$ ]] && return 1
     fi
     
-    log "Iniciando deploy de WAR Ubuntu: $update_path"
+    # Confirmação
+    echo -e "${YELLOW}⚠️ CONFIRMAÇÃO DE DEPLOY WAR${NC}"
+    echo "  • Arquivos: $war_count WARs"
+    echo "  • Servidores: 2 simultâneos (7 total)"
+    echo "  • Preservação: custom + custom_fsw"
+    echo "  • Tempo estimado: 5-10 minutos"
+    echo
+    read -p "🎯 Confirma o deploy? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log "Deploy cancelado pelo usuário"
+        return 1
+    fi
     
-    # Preparar variáveis
+    # Executar deploy
     local timestamp=$(date +%Y%m%d_%H%M%S)
-    local log_file="$LOG_DIR/deploy-war-ubuntu-$timestamp.log"
+    local log_file="$LOG_DIR/deploy-war-simple-$timestamp.log"
     
-    # Executar playbook
-    cd "$ANSIBLE_DIR"
-    log "Executando playbook WAR para Ubuntu..."
+    log "Executando playbook WAR (estrutura simples)..."
     
     if ansible-playbook -i inventory.yml playbooks/update-war.yml \
-        -e "update_source=$full_path" \
         -e "deploy_timestamp=$timestamp" \
-        -e "os_type=ubuntu" \
         | tee "$log_file"; then
         
-        success "Deploy WAR concluído com sucesso!"
-        
-        # Mover para histórico
-        [ -d "$FSX_MOUNT/deployed" ] || mkdir -p "$FSX_MOUNT/deployed"
-        mv "$full_path" "$FSX_MOUNT/deployed/$(basename "$update_path")-deployed-$timestamp"
-        
-        # Remover trigger correspondente
-        rm -f "$FSX_MOUNT/triggers/"*"$(basename "$update_path")"*.json
-        
-        # Criar relatório de sucesso
-        echo "$(date): WAR Deploy SUCCESS - $update_path" >> "$FSX_MOUNT/logs/ubuntu-deploys.log"
-        
-        info "Log detalhado: $log_file"
-        
+        success "🎉 Deploy WAR concluído com sucesso!"
+        echo
+        info "✅ Próximos passos recomendados:"
+        info "  1. Executar validação: ./scripts/validate-deployment.sh --quick"
+        info "  2. Verificar logs: tail -f $log_file"
+        info "  3. Testar aplicação manualmente"
+        echo
         return 0
     else
-        error "Deploy falhou! Verifique o log: $log_file"
-        echo "$(date): WAR Deploy FAILED - $update_path" >> "$FSX_MOUNT/logs/ubuntu-deploys.log"
+        error "❌ Deploy falhou! Verifique o log: $log_file"
+        echo
+        warn "🔧 Para rollback:"
+        warn "  ./deploy-manager.sh rollback"
         return 1
     fi
 }
 
-# Deploy de versão com validações Ubuntu
+# Deploy de versão com estrutura simples
 deploy_version() {
-    local update_path=$1
-    local full_path="$FSX_MOUNT/staging/$update_path"
+    log "🚀 Deploy VERSÃO (Estrutura Simples)"
     
-    if [ ! -d "$full_path" ]; then
-        error "Update não encontrado: $update_path"
+    # Verificar se diretório version existe
+    if [ ! -d "$FSX_MOUNT/staging/version" ]; then
+        error "Diretório VERSION não encontrado: $FSX_MOUNT/staging/version"
+        info "Execute 'list' para criar a estrutura"
         return 1
     fi
     
-    # Validações críticas para deploy de versão
-    log "Validando update de VERSÃO para Ubuntu..."
-    
-    local required_dirs=("webapps" "Datasul-report" "lib")
-    for dir in "${required_dirs[@]}"; do
-        if [ ! -d "$full_path/$dir" ]; then
-            error "Diretório obrigatório não encontrado: $dir"
-            return 1
+    # Verificar subdiretórios obrigatórios
+    local missing_dirs=()
+    for dir in webapps Datasul-report lib; do
+        if [ ! -d "$FSX_MOUNT/staging/version/$dir" ]; then
+            missing_dirs+=("$dir")
         fi
     done
     
-    # Mostrar tamanhos dos diretórios
-    info "Tamanhos dos diretórios:"
-    for dir in "${required_dirs[@]}"; do
-        size=$(du -sh "$full_path/$dir" | cut -f1)
-        echo "  - $dir: $size"
-    done
+    if [ ${#missing_dirs[@]} -ne 0 ]; then
+        error "Subdiretórios obrigatórios não encontrados: ${missing_dirs[*]}"
+        info "Estrutura necessária:"
+        info "  $FSX_MOUNT/staging/version/webapps/"
+        info "  $FSX_MOUNT/staging/version/Datasul-report/"  
+        info "  $FSX_MOUNT/staging/version/lib/"
+        return 1
+    fi
     
-    echo
-    warn "🚨 ATENÇÃO: DEPLOY DE VERSÃO COMPLETA 🚨"
-    warn "Esta operação irá atualizar TODOS os componentes:"
-    warn "- webapps (incluindo todos os WARs)"
-    warn "- Datasul-report (relatórios)"
-    warn "- lib (bibliotecas)"
-    warn ""
-    warn "⚠️  IMPACTO: DOWNTIME PROLONGADO"
-    warn "⚠️  RISCO: ALTO (alteração completa do sistema)"
-    warn ""
-    echo -e "${PURPLE}Servidores que serão atualizados (1 por vez):${NC}"
-    cd "$ANSIBLE_DIR"
-    ansible -i inventory.yml frontend_servers --list-hosts | grep -v "hosts ("
+    # Verificar conteúdo
+    local webapps_count=$(find "$FSX_MOUNT/staging/version/webapps" \( -name "*.war" -o -name "*.WAR" \) 2>/dev/null | wc -l)
+    local datasul_count=$(find "$FSX_MOUNT/staging/version/Datasul-report" -type f 2>/dev/null | wc -l)
+    local lib_count=$(find "$FSX_MOUNT/staging/version/lib" -name "*.jar" 2>/dev/null | wc -l)
+    local total_files=$((webapps_count + datasul_count + lib_count))
+    
+    if [ "$total_files" -eq 0 ]; then
+        error "Nenhum arquivo encontrado nos diretórios de versão"
+        return 1
+    fi
+    
+    # Mostrar conteúdo que será deployado
+    echo -e "${CYAN}📦 Conteúdo que será deployado:${NC}"
+    echo "  📦 webapps/: $webapps_count WARs"
+    echo "  📋 Datasul-report/: $datasul_count arquivos"  
+    echo "  📚 lib/: $lib_count JARs"
+    echo "  📊 Total: $total_files arquivos"
     echo
     
+    # Alertas críticos
+    echo -e "${RED}🚨 ATENÇÃO: DEPLOY DE VERSÃO COMPLETA 🚨${NC}"
+    echo -e "${RED}Esta operação irá substituir TODOS os componentes:${NC}"
+    echo "  • webapps (incluindo todos os WARs)"
+    echo "  • Datasul-report (relatórios)"  
+    echo "  • lib (bibliotecas)"
+    echo
+    echo -e "${YELLOW}⚠️  IMPACTOS:${NC}"
+    echo "  • DOWNTIME PROLONGADO (15+ minutos)"
+    echo "  • RISCO ALTO (alteração completa do sistema)"
+    echo "  • Deploy SEQUENCIAL (1 servidor por vez)"
+    echo
+    echo -e "${GREEN}🔒 PRESERVAÇÃO:${NC}"
+    echo "  • custom/ será preservado"
+    echo "  • custom_fsw/ será preservado"
+    echo "  • Backup completo será criado"
+    echo
+    
+    # Confirmação crítica
     read -p "Confirma o deploy de VERSÃO COMPLETA? Digite 'CONFIRMO': " confirmation
     if [ "$confirmation" != "CONFIRMO" ]; then
         log "Deploy cancelado pelo usuário"
@@ -322,49 +384,40 @@ deploy_version() {
     
     # Verificação final de espaço
     log "Verificação final de espaço em disco..."
-    if ! ansible -i inventory.yml frontend_servers -m shell -a "df /opt/tomcat | tail -1 | awk '{if(\$4 < 2097152) exit 1}'" >/dev/null; then
+    if ! ansible -i inventory.yml frontend_servers -m shell -a "df /opt/tomcat | tail -1 | awk '{if(\$4 < 2097152) exit 1}'" >/dev/null 2>&1; then
         error "Espaço insuficiente em alguns servidores (<2GB disponível)"
         return 1
     fi
     
-    log "Iniciando deploy de VERSÃO Ubuntu: $update_path"
-    
-    # Preparar variáveis
+    # Executar deploy
     local timestamp=$(date +%Y%m%d_%H%M%S)
-    local log_file="$LOG_DIR/deploy-version-ubuntu-$timestamp.log"
+    local log_file="$LOG_DIR/deploy-version-simple-$timestamp.log"
     
-    # Executar playbook
-    cd "$ANSIBLE_DIR"
-    log "Executando playbook de VERSÃO para Ubuntu..."
+    log "Executando playbook VERSÃO (estrutura simples)..."
     info "AVISO: Esta operação pode demorar 30-60 minutos"
     
     if ansible-playbook -i inventory.yml playbooks/update-version.yml \
-        -e "update_source=$full_path" \
         -e "deploy_timestamp=$timestamp" \
-        -e "os_type=ubuntu" \
         | tee "$log_file"; then
         
         success "🎉 Deploy de VERSÃO concluído com sucesso!"
-        
-        # Mover para histórico
-        [ -d "$FSX_MOUNT/deployed" ] || mkdir -p "$FSX_MOUNT/deployed"
-        mv "$full_path" "$FSX_MOUNT/deployed/$(basename "$update_path")-deployed-$timestamp"
-        
-        # Remover trigger correspondente
-        rm -f "$FSX_MOUNT/triggers/"*"$(basename "$update_path")"*.json
-        
-        # Criar relatório de sucesso
-        echo "$(date): VERSION Deploy SUCCESS - $update_path" >> "$FSX_MOUNT/logs/ubuntu-deploys.log"
-        
-        info "Log detalhado: $log_file"
-        warn "IMPORTANTE: Teste completamente a aplicação antes de considerar o deploy finalizado!"
-        
+        echo
+        info "✅ Próximos passos OBRIGATÓRIOS:"
+        info "  1. Testar aplicação completamente"
+        info "  2. Verificar se custom/custom_fsw funcionam"
+        info "  3. Monitorar logs por 1+ hora"
+        info "  4. Validar performance"
+        echo
+        warn "📄 Log detalhado: $log_file"
         return 0
     else
-        error "Deploy de versão falhou! Verifique o log: $log_file"
-        echo "$(date): VERSION Deploy FAILED - $update_path" >> "$FSX_MOUNT/logs/ubuntu-deploys.log"
-        error "CRÍTICO: Sistema pode estar em estado inconsistente"
-        warn "Considere executar rollback imediatamente!"
+        error "❌ Deploy de versão falhou! CRÍTICO!"
+        error "Sistema pode estar em estado inconsistente"
+        echo
+        warn "🚨 AÇÃO IMEDIATA:"
+        warn "  1. Verificar log: $log_file"
+        warn "  2. Considerar rollback: ./deploy-manager.sh rollback"
+        warn "  3. Não fazer novos deploys até resolver!"
         return 1
     fi
 }
@@ -378,7 +431,7 @@ execute_rollback() {
     cd "$ANSIBLE_DIR"
     if ansible-playbook -i inventory.yml playbooks/rollback.yml; then
         success "Rollback executado"
-        echo "$(date): ROLLBACK executed via deploy-manager" >> "$FSX_MOUNT/logs/ubuntu-deploys.log"
+        echo "$(date): ROLLBACK executed via deploy-manager" >> "$FSX_MOUNT/logs/deploy-history.log" 2>/dev/null || true
     else
         error "Rollback falhou - verificação manual necessária"
     fi
@@ -386,7 +439,7 @@ execute_rollback() {
 
 # Ver logs recentes
 view_logs() {
-    echo -e "${BLUE}=== Logs Recentes (Ubuntu) ===${NC}"
+    echo -e "${BLUE}=== Logs Recentes ===${NC}"
     echo
     
     if [ ! -d "$LOG_DIR" ]; then
@@ -416,17 +469,16 @@ show_menu() {
     clear
     echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${BLUE}║                    🚀 DEPLOY MANAGER UBUNTU 🚀                   ║${NC}"
-    echo -e "${BLUE}║                   Tomcat Deployment Automation                  ║${NC}"
+    echo -e "${BLUE}║                Estrutura Simples - Sem Timestamps               ║${NC}"
     echo -e "${BLUE}╠══════════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${BLUE}║  OS: Ubuntu $(lsb_release -rs 2>/dev/null || echo 'Unknown')                                                    ║${NC}"
-    echo -e "${BLUE}║  Ansible: /opt/ansible-deploys                                  ║${NC}"
-    echo -e "${BLUE}║  FSx: /mnt/ansible                                               ║${NC}"
+    echo -e "${BLUE}║  WAR: /mnt/ansible/staging/war/*.WAR                            ║${NC}"
+    echo -e "${BLUE}║  VERSION: /mnt/ansible/staging/version/{webapps,Datasul,lib}/   ║${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${CYAN}1.${NC} 📋 Listar updates disponíveis"
     echo -e "${CYAN}2.${NC} 🏥 Health check do cluster"
-    echo -e "${CYAN}3.${NC} 📦 Deploy WAR"
-    echo -e "${CYAN}4.${NC} 🔄 Deploy Versão (CRÍTICO)"
+    echo -e "${CYAN}3.${NC} 📦 Deploy WAR (estrutura simples)"
+    echo -e "${CYAN}4.${NC} 🔄 Deploy Versão (estrutura simples - CRÍTICO)"
     echo -e "${CYAN}5.${NC} 🚨 Rollback de emergência"
     echo -e "${CYAN}6.${NC} 📄 Ver logs recentes"
     echo -e "${CYAN}7.${NC} ℹ️  Informações do sistema"
@@ -459,21 +511,11 @@ main() {
                     ;;
                 3) 
                     clear
-                    list_updates
-                    echo
-                    read -p "Digite o path do WAR update (ex: war-2025-08-23_14-30-45): " war_path
-                    if [ -n "$war_path" ]; then
-                        deploy_war "$war_path"
-                    fi
+                    deploy_war
                     ;;
                 4)
                     clear
-                    list_updates
-                    echo
-                    read -p "Digite o path do VERSION update (ex: version-2025-08-20_09-15-30): " version_path
-                    if [ -n "$version_path" ]; then
-                        deploy_version "$version_path"
-                    fi
+                    deploy_version
                     ;;
                 5)
                     clear
@@ -488,7 +530,7 @@ main() {
                     show_system_info
                     ;;
                 0) 
-                    log "Saindo do Deploy Manager Ubuntu..."
+                    log "Saindo do Deploy Manager..."
                     exit 0 
                     ;;
                 *) 
@@ -509,12 +551,10 @@ main() {
                 health_check 
                 ;;
             "deploy-war") 
-                [ -z "$2" ] && { error "Uso: $0 deploy-war <path>"; exit 1; }
-                deploy_war "$2" 
+                deploy_war
                 ;;
             "deploy-version")
-                [ -z "$2" ] && { error "Uso: $0 deploy-version <path>"; exit 1; }
-                deploy_version "$2"
+                deploy_version
                 ;;
             "rollback")
                 execute_rollback
@@ -523,16 +563,20 @@ main() {
                 show_system_info
                 ;;
             *) 
-                echo "Deploy Manager - Ubuntu Environment"
+                echo "Deploy Manager - Ubuntu Environment (Estrutura Simples)"
                 echo
                 echo "Uso:"
-                echo "  $0                           # Modo interativo"
-                echo "  $0 list                      # Listar updates"
-                echo "  $0 health                    # Health check"
-                echo "  $0 deploy-war <path>         # Deploy WAR"
-                echo "  $0 deploy-version <path>     # Deploy versão"
-                echo "  $0 rollback                  # Rollback"
-                echo "  $0 info                      # Info do sistema"
+                echo "  $0                    # Modo interativo"
+                echo "  $0 list              # Listar updates"
+                echo "  $0 health            # Health check"
+                echo "  $0 deploy-war        # Deploy WAR"
+                echo "  $0 deploy-version    # Deploy versão"
+                echo "  $0 rollback          # Rollback"
+                echo "  $0 info              # Info do sistema"
+                echo ""
+                echo "Estrutura FSx:"
+                echo "  WAR: $FSX_MOUNT/staging/war/*.WAR"
+                echo "  VERSION: $FSX_MOUNT/staging/version/{webapps,Datasul-report,lib}/"
                 ;;
         esac
     fi
